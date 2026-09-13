@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { PromptEngine } from '../engine.js'
+import { PromptEngine, estimateOaiTokensCached } from '../engine.js'
+import { estimateOaiTokens } from '../../compact/micro.js'
 import { stableStringify } from '../../api/stable-json.js'
 import { latestUserTrailer } from './helpers/message-selectors.js'
 import type { OaiChatRequest, OaiMessage } from '../../api/oai-types.js'
@@ -908,5 +909,51 @@ describe('PromptEngine advisory deduplication', () => {
     engine.setPlanMethodology('full')
     const req3 = engine.buildOaiRequest([{ role: 'user', content: 'c' }])
     assert.match(lastAppendixContent(req3), /<plan-methodology route="full">/)
+  })
+})
+
+describe('estimateOaiTokensCached（issue #139 增量估算）', () => {
+  const mkMsg = (content: string): OaiMessage => ({ role: 'user', content })
+
+  it('与 estimateOaiTokens 结果一致（首算与复用等价）', () => {
+    const messages: OaiMessage[] = [
+      mkMsg('hello world '.repeat(50)),
+      { role: 'assistant', content: '中文回复 '.repeat(30), tool_calls: [{ id: 't1', type: 'function', function: { name: 'grep', arguments: '{"pattern":"x"}' } }], reasoning_content: '思考 '.repeat(20) },
+      { role: 'tool', tool_call_id: 't1', content: 'result '.repeat(40) },
+    ]
+    const cache = new WeakMap<object, import('../engine.js').TokenEstimateEntry>()
+    assert.equal(estimateOaiTokensCached(messages, cache), estimateOaiTokens(messages))
+    // 第二次调用应命中缓存且结果一致
+    assert.equal(estimateOaiTokensCached(messages, cache), estimateOaiTokens(messages))
+  })
+
+  it('追加消息后历史命中缓存、仅计算新增（结果一致）', () => {
+    const head: OaiMessage[] = [mkMsg('old history '.repeat(100))]
+    const cache = new WeakMap<object, import('../engine.js').TokenEstimateEntry>()
+    const first = estimateOaiTokensCached(head, cache)
+    const appended = [...head, mkMsg('new turn '.repeat(20))]
+    const second = estimateOaiTokensCached(appended, cache)
+    assert.equal(second, first + estimateOaiTokens([appended[1]!]))
+    assert.equal(second, estimateOaiTokens(appended))
+  })
+
+  it('原地突变 content 后自动重算（陈性指纹失效）', () => {
+    const msg: OaiMessage & { content: string } = { role: 'user', content: 'a'.repeat(100) }
+    const cache = new WeakMap<object, import('../engine.js').TokenEstimateEntry>()
+    const before = estimateOaiTokensCached([msg], cache)
+    msg.content = 'b'.repeat(300) // 原地替换字符串
+    assert.equal(estimateOaiTokensCached([msg], cache), estimateOaiTokens([msg]))
+    assert.notEqual(before, estimateOaiTokens([msg]))
+  })
+
+  it('tool_calls 数组原地增长后自动重算', () => {
+    const calls = [{ id: 't1', type: 'function' as const, function: { name: 'grep', arguments: '{}' } }]
+    const msg = { role: 'assistant' as const, content: '', tool_calls: calls, reasoning_content: '' }
+    const cache = new WeakMap<object, import('../engine.js').TokenEstimateEntry>()
+    const before = estimateOaiTokensCached([msg], cache)
+    calls.push({ id: 't2', type: 'function' as const, function: { name: 'read_file', arguments: '{}' } })
+    const after = estimateOaiTokensCached([msg], cache)
+    assert.equal(after, estimateOaiTokens([msg]))
+    assert.notEqual(before, after)
   })
 })

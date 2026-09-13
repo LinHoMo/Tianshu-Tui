@@ -3,7 +3,7 @@ import { pruneOutdatedQueryResults } from '../compact/semantic-prune.js'
 import { collapseToolResult } from '../compact/context-collapse.js'
 import { detectStaleness } from '../compact/staleness-detect.js'
 import { CACHE_ANCHOR_MESSAGES } from '../compact/constants.js'
-import { estimateOaiTokens } from '../compact/micro.js'
+import { estimateOaiMessageTokens } from '../compact/micro.js'
 import { buildSystemPrompt, type StaticPromptContext } from './static.js'
 import type { ToolDefinition } from '../api/types.js'
 import { buildStableVolatileBlock, buildLatestTurnVolatileBlock, buildDynamicAppendixParts, buildConsolidatedBlock, renderTaskDepthAdvisory, renderPlanMethodologyAdvisory, FROZEN_BLOCK_CAPS, type AppendixPart, type VolatileContext, type ToolHistoryEntry } from './volatile.js'
@@ -107,6 +107,50 @@ function messageSignature(m: OaiMessage): { sig: string; len: number } {
   if (rec.reasoning_content) s += '\u0000' + String(rec.reasoning_content)
   if (rec.tool_call_id) s += '\u0000' + String(rec.tool_call_id)
   return { sig: `${m.role}\u0000${fullHash(s)}`, len: s.length }
+}
+
+/** 每消息 token 估算缓存条目（issue #139）：三处引用 + tool_calls 长度作为
+ *  陈旧性指纹——条目命中时这些指纹必须全等，任何原地突变都触发重算。 */
+export type TokenEstimateEntry = {
+  contentRef: unknown
+  toolCallsRef: unknown
+  toolCallsLen: number
+  reasoningRef: unknown
+  tokens: number
+}
+
+/**
+ * 带缓存的 per-message token 估算（behavior 等价 estimateOaiTokens）。
+ * 长会话稳态下历史消息跨轮保持同一对象引用 → 命中缓存跳过逐字符 CJK/ASCII
+ * 分类，把每轮 O(历史字节) 降到 O(新增)；缓存随消息对象被 GC（WeakMap），
+ * 无界增长风险为零。缓存对请求字节零影响——仅用于 T7 fillRatio 门控。
+ */
+export function estimateOaiTokensCached(messages: OaiMessage[], cache: WeakMap<object, TokenEstimateEntry>): number {
+  let total = 0
+  for (const msg of messages) {
+    const m = msg as unknown as { content?: unknown; tool_calls?: unknown; reasoning_content?: unknown }
+    const toolCalls = m.tool_calls
+    const toolCallsLen = Array.isArray(toolCalls) ? toolCalls.length : 0
+    const cached = cache.get(msg as object)
+    if (cached
+      && cached.contentRef === m.content
+      && cached.toolCallsRef === toolCalls
+      && cached.toolCallsLen === toolCallsLen
+      && cached.reasoningRef === m.reasoning_content) {
+      total += cached.tokens
+      continue
+    }
+    const tokens = estimateOaiMessageTokens(msg)
+    cache.set(msg as object, {
+      contentRef: m.content,
+      toolCallsRef: toolCalls,
+      toolCallsLen,
+      reasoningRef: m.reasoning_content,
+      tokens,
+    })
+    total += tokens
+  }
+  return total
 }
 
 export interface PromptEngineConfig {
@@ -257,8 +301,12 @@ export class PromptEngine {
   /** Hash of last message array to distinguish exact same call from true duplicate. */
   private lastMessageHash: string = ''
   private userMessagesSinceGitRefresh = 0
-  /** Prefix-divergence probe: per-message signatures of the previous request. */
-  private prevRequestSignatures: Array<{ sig: string; len: number }> | null = null
+  /** Prefix-divergence probe: per-message signatures of the previous request.
+   *  每条含消息对象与 content 引用（identity 复用判断用，issue #139 增量优化）。 */
+  private prevRequestSignatures: Array<{ sig: string; len: number; msg: OaiMessage; contentRef: unknown }> | null = null
+  /** 每消息 token 估算缓存（WeakMap，随消息对象回收）；键为消息对象，
+   *  命中需 content/tool_calls/reasoning 引用一致，防原地突变导致的陈旧值。 */
+  private tokenEstimateCache = new WeakMap<object, TokenEstimateEntry>()
   /** Latest divergence vs the previous request (consume-once via consumePrefixDivergence). */
   private lastPrefixDivergence: PrefixDivergence | null = null
   /** Append-only delta: last emitted context-update sub-blocks (name→content). */
@@ -836,7 +884,7 @@ export class PromptEngine {
       // `chars/4` undercounted CJK text by ~3.3× and ignored tool_calls, so on
       // CJK-heavy sessions the T7 gate fired far later than maybeCompact's
       // ratio — leaving the two subsystems' compaction decisions uncoordinated.
-      const estTokens = estimateOaiTokens(result)
+      const estTokens = estimateOaiTokensCached(result, this.tokenEstimateCache)
       const fillRatio = estTokens / contextWindow
 
       // Lightweight pass (0–85%): strip reasoning + fold duplicate grep/read.
@@ -901,14 +949,34 @@ export class PromptEngine {
    * index; pure appends record nothing.
    */
   private recordPrefixDivergence(messages: OaiMessage[]): void {
-    const sigs = messages.map(messageSignature)
     const prev = this.prevRequestSignatures
+    // 增量签名（issue #139）：append-only 稳态下复用上一轮的签名（对象与
+    // content 引用均未变 → 字节必然未变），只对新增/变化尾部重算——把每轮
+    // O(全历史字节) 的全量哈希降到 O(新增)。签名仅用于诊断（cache-log /
+    // meta stats），不进入请求字节，优化不影响前缀缓存稳定性。
+    const sigs: Array<{ sig: string; len: number; msg: OaiMessage; contentRef: unknown }> = new Array(messages.length)
+    const shared = prev ? Math.min(prev.length, messages.length) : 0
+    let i = 0
+    for (; i < shared; i++) {
+      const p = prev![i]!
+      const m = messages[i]!
+      if (p.msg === m && p.contentRef === m.content) {
+        sigs[i] = p
+        continue
+      }
+      break
+    }
+    for (; i < messages.length; i++) {
+      const m = messages[i]!
+      const { sig, len } = messageSignature(m)
+      sigs[i] = { sig, len, msg: m, contentRef: m.content }
+    }
     this.prevRequestSignatures = sigs
     if (!prev) return
 
-    const shared = Math.min(prev.length, sigs.length)
+    const sharedLen = Math.min(prev.length, sigs.length)
     let divergedIdx = -1
-    for (let i = 0; i < shared; i++) {
+    for (let i = 0; i < sharedLen; i++) {
       if (prev[i]!.sig !== sigs[i]!.sig) { divergedIdx = i; break }
     }
     if (divergedIdx === -1) {
