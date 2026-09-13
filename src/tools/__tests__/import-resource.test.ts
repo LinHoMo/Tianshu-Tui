@@ -42,14 +42,28 @@ describe('import_resource', () => {
       assert.equal(subpathEscapesContainer('/a/b/repo', ''), false)
     })
 
-    it('rejects a symlink inside the container that points outside', () => {
+    it('rejects a symlink inside the container that points outside', (t) => {
       const root = mkdtempSync(join(tmpdir(), 'import-guard-'))
+      const outside = mkdtempSync(join(tmpdir(), 'import-guard-outside-'))
       try {
         mkdirSync(join(root, 'inner'), { recursive: true })
-        symlinkSync('/etc', join(root, 'inner', 'link'))
+        writeFileSync(join(outside, 'passwd'), 'secret')
+        let symlinkable = true
+        try {
+          symlinkSync(outside, join(root, 'inner', 'link'))
+        } catch {
+          // Windows 未开启开发者模式时 symlink 创建返回 EPERM——能力探测后跳过，
+          // 其余词法/真实层校验用例不受影响。
+          symlinkable = false
+        }
+        if (!symlinkable) {
+          t.skip('symlink creation not permitted on this platform (Windows requires Developer Mode)')
+          return
+        }
         assert.equal(subpathEscapesContainer(root, 'inner/link/passwd'), true)
       } finally {
         rmSync(root, { recursive: true, force: true })
+        rmSync(outside, { recursive: true, force: true })
       }
     })
   })

@@ -215,7 +215,14 @@ describe('buildAssemblyFailureResult（结果装配兜底）', () => {
 })
 
 describe('BASH_TOOL timeout cleanup', () => {
-  it('kills background descendants when a command times out', async () => {
+  it('kills background descendants when a command times out', async (t) => {
+    // POSIX-only 命令形态（nohup … & wait）。Windows 上 Git Bash 的后台子进程
+    // 经 msys DLL 派生，taskkill /T 无法命中（见 issue #144）；平台无关等价
+    // 覆盖在别处，此处跳过避免在 Windows 上假红。
+    if (process.platform === 'win32') {
+      t.skip('POSIX-only backgrounding command (nohup & wait); Windows/MSYS tree-kill tracked in issue #144')
+      return
+    }
     const dir = mkdtempSync(join(tmpdir(), 'rivet-bash-timeout-'))
     const marker = join(dir, 'marker.txt')
     const command = `nohup node -e "setTimeout(()=>require('fs').writeFileSync(process.argv[1], 'alive'), 300)" "${marker}" >/dev/null 2>&1 & wait`
@@ -379,8 +386,12 @@ describe('sanitizeEnv', () => {
 
   it('preserves PATH and HOME', () => {
     const result = sanitizeEnv(process.env)
-    assert.ok(result.PATH, 'PATH should be preserved')
-    assert.ok(result.HOME, 'HOME should be preserved')
+    // Windows 上 process.env 的键名是 'Path'（仅首字母大写）且 Node 不归一化，
+    // 按大小写不敏感查找断言，避免 Windows 下误报。
+    const pathKey = Object.keys(result).find(k => k.toLowerCase() === 'path')
+    assert.ok(pathKey && result[pathKey], 'PATH should be preserved')
+    // HOME 在 Windows GUI 启动的进程里可能天然缺失——只在存在时断言保留。
+    if (process.env.HOME) assert.ok(result.HOME, 'HOME should be preserved')
   })
 
   it('strips vars with TOKEN in name', () => {
